@@ -7,21 +7,18 @@ XLMRobertaForSequenceClassification (e.g. BAAI/bge-m3) across the
 four dtypes that ppc64le supports: float32, bfloat16, float16, and
 the mixed fp16-encoder/fp32-head split that vLLM chooses by default.
 
-Reuses:
-  - benchmark_cpu_attn.main / generate_seq_lens  — attention kernel
-  - torch.utils.benchmark.Timer                  — FFN + LayerNorm timing
-  - vllm.utils.torch_utils.set_random_seed       — reproducibility
+Uses only PyTorch primitives — no compiled vLLM C++ extensions required.
+Can be run with just: torch + numpy installed.
 
 bge-m3 config: hidden=1024, heads=16, head_dim=64, ffn=4096, layers=24
 """
 
+import argparse
 import time
 
 import numpy as np
 import torch
 import torch.utils.benchmark as TBenchmark
-
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # ---------------------------------------------------------------------------
 # bge-m3 model constants
@@ -113,78 +110,32 @@ fn.linear(h, w_proj, b_proj)
 
 
 # ---------------------------------------------------------------------------
-# Capture attn_main stdout and extract mean latency
+# Benchmark: Attention  (bidirectional SDPA — matches encoder-only VSX path)
 # ---------------------------------------------------------------------------
 
+@torch.inference_mode()
 def _run_attn_bench(dtype: torch.dtype, seq_len: int, iters: int, seed: int) -> float:
-    """Runs the attention kernel benchmark and returns mean latency in ms.
+    """Full bidirectional self-attention via torch SDPA (no vLLM C++ needed).
 
-    Reimplements the core of benchmark_cpu_attn.main() directly to avoid
-    its set_random_seed() call, which raises NotImplementedError on CPU.
+    Uses scaled_dot_product_attention with is_causal=False to match the
+    encoder-only (non-causal) attention that XLMRoberta uses, and widening
+    Q/K/V to fp32 to match what the VSX kernel does on ppc64le.
     """
-    import numpy as np
-
-    from vllm._custom_ops import (
-        cpu_attention_with_kv_cache,
-        cpu_attn_get_scheduler_metadata,
-        cpu_attn_reshape_and_cache,
-    )
-    from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
-
     torch.manual_seed(seed)
-
-    num_seqs = 1
-    query_lens = [seq_len]
-    kv_lens = [seq_len]
     scale = HEAD_DIM ** -0.5
 
-    isa = _get_attn_isa(dtype, BLOCK_SIZE, HEAD_DIM)
-
-    num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 1
-    query = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
-    packed_key_cache = torch.empty(num_blocks, NUM_HEADS, BLOCK_SIZE, HEAD_DIM, dtype=dtype)
-    packed_value_cache = torch.empty_like(packed_key_cache)
-
-    # populate cache via reshape_and_cache
-    key = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
-    value = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
-    slot_mapping = torch.arange(seq_len, dtype=torch.int64)
-    cpu_attn_reshape_and_cache(key, value, packed_key_cache, packed_value_cache,
-                               slot_mapping, isa)
-
-    cu_query_lens = torch.tensor([0, seq_len], dtype=torch.int32)
-    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
-    block_tables = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
-    metadata = cpu_attn_get_scheduler_metadata(
-        num_reqs=num_seqs,
-        num_heads=NUM_HEADS,
-        num_kv_heads=NUM_HEADS,
-        head_dim=HEAD_DIM,
-        seq_lens=kv_lens_t,
-        dtype=dtype,
-        query_start_loc=cu_query_lens,
-        causal=False,   # encoder-only: bidirectional
-        sliding_window_size=-1,
-        isa=isa,
-        enable_kv_split=False,
-    )
-    output = torch.empty_like(query)
+    # [seq, heads, head_dim] — same layout as vLLM CPU attention
+    q = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
+    k = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
+    v = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
 
     def _run():
-        cpu_attention_with_kv_cache(
-            query=query,
-            key_cache=packed_key_cache,
-            value_cache=packed_value_cache,
-            output=output,
-            query_start_loc=cu_query_lens,
-            seq_lens=kv_lens_t,
-            scale=scale,
-            causal=False,
-            alibi_slopes=None,
-            sliding_window=-1,
-            block_table=block_tables,
-            softcap=0,
-            scheduler_metadata=metadata,
+        # Widen to fp32: matches load_row8_B_as_f32 in cpu_attn_vsx.hpp
+        q_f = q.float().transpose(0, 1)   # [heads, seq, head_dim]
+        k_f = k.float().transpose(0, 1)
+        v_f = v.float().transpose(0, 1)
+        torch.nn.functional.scaled_dot_product_attention(
+            q_f, k_f, v_f, scale=scale, is_causal=False
         )
 
     # warmup
@@ -258,7 +209,7 @@ def main(seq_lens: list[int], iters: int, seed: int) -> None:
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Dtype benchmark for bge-m3 on ppc64le CPU"
     )
     parser.add_argument(
