@@ -14,9 +14,6 @@ bge-m3 config: hidden=1024, heads=16, head_dim=64, ffn=4096, layers=24
 """
 
 import argparse
-import time
-
-import numpy as np
 import torch
 import torch.utils.benchmark as TBenchmark
 
@@ -38,6 +35,13 @@ DTYPES: dict[str, torch.dtype] = {
 
 MIN_RUN_TIME = 1.0  # seconds per Timer.blocked_autorange call
 
+# On ppc64le there is no native fp16 GEMM or SDPA kernel.
+# PyTorch falls back to fp32 for fp16 linear/SDPA transparently.
+# We make this explicit: fp16 inputs are widened to fp32 before every
+# compute call, exactly as the VSX C++ kernel does in load_row8_B_as_f32.
+# This means fp16 benchmarks measure: cast_cost + fp32_compute, which is
+# the true per-request cost on this platform.
+
 
 # ---------------------------------------------------------------------------
 # Benchmark: FFN  (BertIntermediate + BertOutput residual + LayerNorm)
@@ -45,27 +49,38 @@ MIN_RUN_TIME = 1.0  # seconds per Timer.blocked_autorange call
 
 @torch.inference_mode()
 def bench_ffn(seq_len: int, dtype: torch.dtype) -> float:
-    """Returns median latency in ms for one FFN sub-layer."""
-    x      = torch.randn(seq_len, HIDDEN,        dtype=dtype)
-    w_up   = torch.randn(INTERMEDIATE, HIDDEN,   dtype=dtype)
-    b_up   = torch.randn(INTERMEDIATE,           dtype=dtype)
-    w_down = torch.randn(HIDDEN, INTERMEDIATE,   dtype=dtype)
-    b_down = torch.randn(HIDDEN,                 dtype=dtype)
-    ln_w   = torch.randn(HIDDEN,                 dtype=dtype)
-    ln_b   = torch.randn(HIDDEN,                 dtype=dtype)
+    """Returns median latency in ms for one FFN sub-layer.
+
+    On ppc64le there is no native fp16/bf16 GEMM; PyTorch upcasts to fp32
+    internally. We store weights and activations in `dtype` and widen to
+    fp32 explicitly before each linear call, matching the true runtime cost
+    (storage bandwidth in `dtype` + fp32 compute).
+    """
+    # stored in native dtype
+    x      = torch.randn(seq_len, HIDDEN,      dtype=dtype)
+    w_up   = torch.randn(INTERMEDIATE, HIDDEN, dtype=dtype)
+    b_up   = torch.randn(INTERMEDIATE,         dtype=dtype)
+    w_down = torch.randn(HIDDEN, INTERMEDIATE, dtype=dtype)
+    b_down = torch.randn(HIDDEN,               dtype=dtype)
+    ln_w   = torch.randn(HIDDEN,               dtype=dtype)
+    ln_b   = torch.randn(HIDDEN,               dtype=dtype)
 
     fn = torch.nn.functional
 
     t = TBenchmark.Timer(
         stmt="""
-h = fn.linear(x, w_up, b_up)
+xf = x.float(); wuf = w_up.float(); buf = b_up.float()
+wdf = w_down.float(); bdf = b_down.float()
+lnwf = ln_w.float(); lnbf = ln_b.float()
+h = fn.linear(xf, wuf, buf)
 h = fn.gelu(h)
-h = fn.linear(h, w_down, b_down)
-fn.layer_norm(h + x, (HIDDEN,), ln_w, ln_b)
+h = fn.linear(h, wdf, bdf)
+fn.layer_norm(h + xf, (HIDDEN,), lnwf, lnbf)
 """,
         globals=dict(
-            fn=fn, x=x, w_up=w_up, b_up=b_up, w_down=w_down,
-            b_down=b_down, ln_w=ln_w, ln_b=ln_b, HIDDEN=HIDDEN,
+            fn=fn, x=x, w_up=w_up, b_up=b_up,
+            w_down=w_down, b_down=b_down,
+            ln_w=ln_w, ln_b=ln_b, HIDDEN=HIDDEN,
         ),
         label="FFN",
         sub_label=f"seq={seq_len}",
@@ -110,45 +125,44 @@ fn.linear(h, w_proj, b_proj)
 
 
 # ---------------------------------------------------------------------------
-# Benchmark: Attention  (bidirectional SDPA — matches encoder-only VSX path)
+# Benchmark: Attention  (bidirectional — matches encoder-only VSX path)
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
 def _run_attn_bench(dtype: torch.dtype, seq_len: int, iters: int, seed: int) -> float:
-    """Full bidirectional self-attention via torch SDPA (no vLLM C++ needed).
+    """Bidirectional self-attention timed at the true ppc64le cost.
 
-    Uses scaled_dot_product_attention with is_causal=False to match the
-    encoder-only (non-causal) attention that XLMRoberta uses, and widening
-    Q/K/V to fp32 to match what the VSX kernel does on ppc64le.
+    The VSX C++ kernel (cpu_attn_vsx.hpp) always widens KV to fp32 via
+    load_row8_B_as_f32 before the GEMM, regardless of storage dtype.
+    We replicate that here: Q/K/V are stored in `dtype`, widened to fp32
+    at call time, then SDPA runs in fp32. For float32 inputs the widen is
+    a no-op. For bfloat16/float16 the cast overhead is included, matching
+    the real kernel cost.
     """
     torch.manual_seed(seed)
     scale = HEAD_DIM ** -0.5
 
-    # [seq, heads, head_dim] — same layout as vLLM CPU attention
+    # stored in native dtype, widened inside _run() — same as VSX kernel
     q = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
     k = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
     v = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
 
-    def _run():
-        # Widen to fp32: matches load_row8_B_as_f32 in cpu_attn_vsx.hpp
-        q_f = q.float().transpose(0, 1)   # [heads, seq, head_dim]
-        k_f = k.float().transpose(0, 1)
-        v_f = v.float().transpose(0, 1)
-        torch.nn.functional.scaled_dot_product_attention(
-            q_f, k_f, v_f, scale=scale, is_causal=False
-        )
-
-    # warmup
-    for _ in range(5):
-        _run()
-
-    times = []
-    for _ in range(iters):
-        start = time.perf_counter_ns()
-        _run()
-        times.append((time.perf_counter_ns() - start) / 1e6)
-
-    return float(np.mean(times))
+    t = TBenchmark.Timer(
+        stmt="""
+q_f = q.float().transpose(0, 1)
+k_f = k.float().transpose(0, 1)
+v_f = v.float().transpose(0, 1)
+torch.nn.functional.scaled_dot_product_attention(
+    q_f, k_f, v_f, scale=scale, is_causal=False)
+""",
+        globals=dict(q=q, k=k, v=v, scale=scale,
+                     torch=torch),
+        label="Attn",
+        sub_label=f"seq={seq_len}",
+        description=str(dtype),
+    )
+    m = t.blocked_autorange(min_run_time=MIN_RUN_TIME)
+    return m.median * 1e3  # ms
 
 
 # ---------------------------------------------------------------------------
