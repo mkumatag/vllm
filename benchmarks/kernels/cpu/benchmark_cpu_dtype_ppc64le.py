@@ -22,7 +22,6 @@ import torch
 import torch.utils.benchmark as TBenchmark
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.torch_utils import set_random_seed
 
 from .benchmark_cpu_attn import generate_seq_lens
 from .benchmark_cpu_attn import main as attn_main
@@ -153,7 +152,7 @@ def _run_attn_bench(dtype: torch.dtype, seq_len: int, iters: int) -> float:
 # ---------------------------------------------------------------------------
 
 def main(seq_lens: list[int], iters: int, seed: int) -> None:
-    set_random_seed(seed)
+    torch.manual_seed(seed)
 
     print(f"\nTorch {torch.__version__}  |  threads={torch.get_num_threads()}")
     print(f"Model: hidden={HIDDEN}, heads={NUM_HEADS}, head_dim={HEAD_DIM}, "
