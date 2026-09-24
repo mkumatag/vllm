@@ -15,16 +15,13 @@ Reuses:
 bge-m3 config: hidden=1024, heads=16, head_dim=64, ffn=4096, layers=24
 """
 
-import sys
-from io import StringIO
+import time
 
+import numpy as np
 import torch
 import torch.utils.benchmark as TBenchmark
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-from .benchmark_cpu_attn import generate_seq_lens
-from .benchmark_cpu_attn import main as attn_main
 
 # ---------------------------------------------------------------------------
 # bge-m3 model constants
@@ -119,32 +116,88 @@ fn.linear(h, w_proj, b_proj)
 # Capture attn_main stdout and extract mean latency
 # ---------------------------------------------------------------------------
 
-def _run_attn_bench(dtype: torch.dtype, seq_len: int, iters: int) -> float:
-    """Calls the existing attn benchmark and returns mean ms."""
-    seq_lens = generate_seq_lens(
-        batch_size=1,
-        q_len_min=seq_len, q_len_max=seq_len,
-        kv_len_min=seq_len, kv_len_max=seq_len,
-    )
-    buf = StringIO()
-    old_stdout = sys.stdout
-    sys.stdout = buf
-    try:
-        attn_main(
-            seq_lens=seq_lens,
-            num_heads=(NUM_HEADS, NUM_HEADS),
-            head_size=HEAD_DIM,
-            dtype=dtype,
-            block_size=BLOCK_SIZE,
-            iters=iters,
-        )
-    finally:
-        sys.stdout = old_stdout
+def _run_attn_bench(dtype: torch.dtype, seq_len: int, iters: int, seed: int) -> float:
+    """Runs the attention kernel benchmark and returns mean latency in ms.
 
-    for line in buf.getvalue().splitlines():
-        if "mean" in line:
-            return float(line.split("=")[-1].strip())
-    return float("nan")
+    Reimplements the core of benchmark_cpu_attn.main() directly to avoid
+    its set_random_seed() call, which raises NotImplementedError on CPU.
+    """
+    import numpy as np
+
+    from vllm._custom_ops import (
+        cpu_attention_with_kv_cache,
+        cpu_attn_get_scheduler_metadata,
+        cpu_attn_reshape_and_cache,
+    )
+    from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
+
+    torch.manual_seed(seed)
+
+    num_seqs = 1
+    query_lens = [seq_len]
+    kv_lens = [seq_len]
+    scale = HEAD_DIM ** -0.5
+
+    isa = _get_attn_isa(dtype, BLOCK_SIZE, HEAD_DIM)
+
+    num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 1
+    query = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
+    packed_key_cache = torch.empty(num_blocks, NUM_HEADS, BLOCK_SIZE, HEAD_DIM, dtype=dtype)
+    packed_value_cache = torch.empty_like(packed_key_cache)
+
+    # populate cache via reshape_and_cache
+    key = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
+    value = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, dtype=dtype)
+    slot_mapping = torch.arange(seq_len, dtype=torch.int64)
+    cpu_attn_reshape_and_cache(key, value, packed_key_cache, packed_value_cache,
+                               slot_mapping, isa)
+
+    cu_query_lens = torch.tensor([0, seq_len], dtype=torch.int32)
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=num_seqs,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        seq_lens=kv_lens_t,
+        dtype=dtype,
+        query_start_loc=cu_query_lens,
+        causal=False,   # encoder-only: bidirectional
+        sliding_window_size=-1,
+        isa=isa,
+        enable_kv_split=False,
+    )
+    output = torch.empty_like(query)
+
+    def _run():
+        cpu_attention_with_kv_cache(
+            query=query,
+            key_cache=packed_key_cache,
+            value_cache=packed_value_cache,
+            output=output,
+            query_start_loc=cu_query_lens,
+            seq_lens=kv_lens_t,
+            scale=scale,
+            causal=False,
+            alibi_slopes=None,
+            sliding_window=-1,
+            block_table=block_tables,
+            softcap=0,
+            scheduler_metadata=metadata,
+        )
+
+    # warmup
+    for _ in range(5):
+        _run()
+
+    times = []
+    for _ in range(iters):
+        start = time.perf_counter_ns()
+        _run()
+        times.append((time.perf_counter_ns() - start) / 1e6)
+
+    return float(np.mean(times))
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +223,7 @@ def main(seq_lens: list[int], iters: int, seed: int) -> None:
 
     for seq_len in seq_lens:
         for name, dtype in DTYPES.items():
-            attn_ms = _run_attn_bench(dtype, seq_len, iters)
+            attn_ms = _run_attn_bench(dtype, seq_len, iters, seed)
             ffn_ms  = bench_ffn(seq_len, dtype)
             # Approximate full inference: 24 × (attn + ffn)
             total_ms = NUM_LAYERS * (attn_ms + ffn_ms)
